@@ -333,27 +333,42 @@ __host__ inline void close_socket(int sock_fd) {
 
     The main functions meant to be used by the user are:
 
-        KittensBroker broker(local_rank, local_world_size);
+        KittensBroker broker(local_rank, local_world_size, group_id);
         broker.exchange_data(dst, src, size); // exchange data between all processes
         broker.exchange_fds(dst, src_fd); // exchange file descriptors between all processes
         broker.broadcast_fd(dst, src_fd, src_rank); // broadcast file descriptor from src_rank to all processes
         broker.sync(); // wait until all processes reach here
  */
 struct KittensBroker {
-    // TODO: make unique per process group
-    static inline constexpr const char *SHM_KEY_ = "/kittens_broker_shm";
-    static inline constexpr const char *SOCK_KEY_ = "/tmp/kittens_broker.sock";
+    static inline constexpr const char *SHM_KEY_PREFIX = "/kittens_broker_g";
+    static inline constexpr const char *SOCK_KEY_PREFIX = "/tmp/kittens_broker_";
 
     int local_rank_;
     int local_world_size_;
+    int group_id_;  // Distributed group ID for isolation
+
+    std::string shm_key_;   // Group-specific shared memory key
+    std::string sock_key_;  // Group-specific socket key
 
     void *shm_raw_;
     volatile detail::broker::KittensVault *shm_;
     int sock_;
 
-    __host__ inline KittensBroker(int local_rank, int local_world_size)
+    // Helper function to generate keys based on group_id
+    __host__ inline static std::string make_shm_key(int group_id) {
+        return std::string(SHM_KEY_PREFIX) + std::to_string(group_id) + "_shm";
+    }
+
+    __host__ inline static std::string make_sock_key(int group_id) {
+        return std::string(SOCK_KEY_PREFIX) + std::to_string(group_id) + ".sock";
+    }
+
+    __host__ inline KittensBroker(int local_rank, int local_world_size, int group_id = 0)
         : local_rank_(local_rank), 
           local_world_size_(local_world_size),
+          group_id_(group_id),
+          shm_key_(make_shm_key(group_id)),
+          sock_key_(make_sock_key(group_id)),
           shm_raw_(nullptr),
           shm_(nullptr),
           sock_(-1) {
@@ -363,25 +378,32 @@ struct KittensBroker {
             throw std::runtime_error("KittensBroker: Local rank is greater than local world size");
         if (local_world_size_ > detail::broker::MAX_LOCAL_WORLD_SIZE)
             throw std::runtime_error("KittensBroker: Local world size is greater than MAX_LOCAL_WORLD_SIZE");
+        if (group_id_ < 0)
+            throw std::runtime_error("KittensBroker: Group ID must be non-negative");
 
         if (local_rank_ == 0) {
-            shm_raw_ = detail::broker::create_shm(SHM_KEY_, sizeof(detail::broker::KittensVault));
+            shm_raw_ = detail::broker::create_shm(shm_key_.c_str(), sizeof(detail::broker::KittensVault));
             shm_ = reinterpret_cast<volatile detail::broker::KittensVault *>(shm_raw_);
             memset(shm_raw_, 0, sizeof(detail::broker::KittensVault));
         } else {
-            shm_raw_ = detail::broker::open_shm(SHM_KEY_, sizeof(detail::broker::KittensVault));
+            shm_raw_ = detail::broker::open_shm(shm_key_.c_str(), sizeof(detail::broker::KittensVault));
             shm_ = reinterpret_cast<volatile detail::broker::KittensVault *>(shm_raw_);
         }
         detail::broker::init_sync(local_rank_, shm_);
         detail::broker::sync(local_world_size_, shm_);
 
-        if (local_rank_ ==0)
-            detail::broker::unlink_shm(SHM_KEY_);
+        if (local_rank_ == 0)
+            detail::broker::unlink_shm(shm_key_.c_str());
         detail::broker::sync(local_world_size_, shm_);
 
-        sock_ = detail::broker::create_socket(SOCK_KEY_, local_rank_);
+        sock_ = detail::broker::create_socket(sock_key_.c_str(), local_rank_);
         detail::broker::sync(local_world_size_, shm_);
     }
+
+    // Getters for debugging
+    __host__ inline int get_group_id() const { return group_id_; }
+    __host__ inline const std::string& get_shm_key() const { return shm_key_; }
+    __host__ inline const std::string& get_sock_key() const { return sock_key_; }
 
     KittensBroker(const KittensBroker&) = delete;
     KittensBroker& operator=(const KittensBroker&) = delete;
@@ -389,11 +411,15 @@ struct KittensBroker {
     __host__ inline KittensBroker(KittensBroker&& other) noexcept
         : local_rank_(other.local_rank_),
           local_world_size_(other.local_world_size_),
+          group_id_(other.group_id_),
+          shm_key_(std::move(other.shm_key_)),
+          sock_key_(std::move(other.sock_key_)),
           shm_raw_(other.shm_raw_),
           shm_(other.shm_),
           sock_(other.sock_) {
         other.local_rank_ = -1;
         other.local_world_size_ = -1;
+        other.group_id_ = -1;
         other.shm_raw_ = nullptr;
         other.shm_ = nullptr;
         other.sock_ = -1;
@@ -406,12 +432,13 @@ struct KittensBroker {
             shm_ = nullptr;
         }
         if (sock_ >= 0) {
-            detail::broker::unlink_socket(SOCK_KEY_, local_rank_);
+            detail::broker::unlink_socket(sock_key_.c_str(), local_rank_);
             detail::broker::close_socket(sock_);
             sock_ = -1;
         }
         local_rank_ = -1;
         local_world_size_ = -1;
+        group_id_ = -1;
     }
 
     __host__ inline KittensBroker& operator=(KittensBroker&& other) noexcept {
@@ -419,11 +446,15 @@ struct KittensBroker {
             destroy();
             local_rank_ = other.local_rank_;
             local_world_size_ = other.local_world_size_;
+            group_id_ = other.group_id_;
+            shm_key_ = std::move(other.shm_key_);
+            sock_key_ = std::move(other.sock_key_);
             shm_raw_ = other.shm_raw_;
             shm_ = other.shm_;
             sock_ = other.sock_;
             other.local_rank_ = -1;
             other.local_world_size_ = -1;
+            other.group_id_ = -1;
             other.shm_raw_ = nullptr;
             other.shm_ = nullptr;
             other.sock_ = -1;
@@ -491,14 +522,14 @@ struct KittensBroker {
                 for (int src_local_rank = 0; src_local_rank < local_world_size_; src_local_rank++) {
                     if (dst_local_rank == src_local_rank)
                         continue;
-                    detail::broker::send_fd(sock_, dst[src_local_rank], SOCK_KEY_, dst_local_rank, src_local_rank);
+                    detail::broker::send_fd(sock_, dst[src_local_rank], sock_key_.c_str(), dst_local_rank, src_local_rank);
                 }
             }
             close(dst[0]); // no longer needed
             dst[0] = -1;
         } else {
             // The rest sends its FD to and receives the other FDs from rank 0
-            detail::broker::send_fd(sock_, data_fd, SOCK_KEY_, 0, local_rank_);
+            detail::broker::send_fd(sock_, data_fd, sock_key_.c_str(), 0, local_rank_);
             close(data_fd); // no longer needed
             for (int i = 0; i < local_world_size_ - 1; i++) {
                 int received_fd;
@@ -529,7 +560,7 @@ struct KittensBroker {
             for (int dst_local_rank = 0; dst_local_rank < local_world_size_; dst_local_rank++) {
                 if (dst_local_rank == src_local_rank)
                     continue;
-                detail::broker::send_fd(sock_, data_fd, SOCK_KEY_, dst_local_rank, src_local_rank);
+                detail::broker::send_fd(sock_, data_fd, sock_key_.c_str(), dst_local_rank, src_local_rank);
             }
             close(data_fd); // no longer needed
         } else {

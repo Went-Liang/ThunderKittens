@@ -60,6 +60,46 @@ __host__ inline static void vm_set_access(
     CUCHECK(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(ptr), size, descs.data(), num_devices));
 }
 
+__host__ inline static void vm_set_access_devices(
+    void *ptr,
+    const size_t size,
+    const std::vector<int> &device_ids
+) {
+    std::vector<CUmemAccessDesc> descs(device_ids.size());
+    for (size_t i = 0; i < device_ids.size(); i++) {
+        descs[i].location.id = device_ids[i];
+        descs[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        descs[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    }
+    CUCHECK(cuMemSetAccess(reinterpret_cast<CUdeviceptr>(ptr), size, descs.data(), device_ids.size()));
+}
+
+// Enable P2P access between all pairs of devices in the given list
+__host__ inline static void enable_p2p_access(const std::vector<int> &device_ids) {
+    for (size_t i = 0; i < device_ids.size(); i++) {
+        for (size_t j = 0; j < device_ids.size(); j++) {
+            if (i != j) {
+                int can_access = 0;
+                CUDACHECK(cudaDeviceCanAccessPeer(&can_access, device_ids[i], device_ids[j]));
+                if (can_access) {
+                    int current_device;
+                    CUDACHECK(cudaGetDevice(&current_device));
+                    if (current_device != device_ids[i]) {
+                        CUDACHECK(cudaSetDevice(device_ids[i]));
+                    }
+                    cudaError_t p2p_err = cudaDeviceEnablePeerAccess(device_ids[j], 0);
+                    if (p2p_err != cudaSuccess && p2p_err != cudaErrorPeerAccessAlreadyEnabled) {
+                        CUDACHECK(p2p_err);
+                    }
+                    if (current_device != device_ids[i]) {
+                        CUDACHECK(cudaSetDevice(current_device));
+                    }
+                }
+            }
+        }
+    }
+}
+
 __host__ inline static void vm_retrieve_handle(
     CUmemGenericAllocationHandle *handle,
     void *ptr
@@ -93,6 +133,23 @@ __host__ inline static void vm_alloc_map_set_access(
     vm_alloc(&handle, allocated_size, size, device_id);
     vm_map(ptr, handle, *allocated_size);
     vm_set_access(*ptr, *allocated_size, num_devices);
+    vm_free(handle); // release the handle ASAP
+}
+
+__host__ inline static void vm_alloc_map_set_access_devices(
+    void **ptr,
+    size_t *allocated_size,
+    const size_t size,
+    const int device_id,
+    const std::vector<int> &device_ids
+) {
+    CUmemGenericAllocationHandle handle;
+    vm_alloc(&handle, allocated_size, size, device_id);
+    vm_map(ptr, handle, *allocated_size);
+    // Enable P2P access between all devices in the group
+    enable_p2p_access(device_ids);
+    // Set access only for devices in this group
+    vm_set_access_devices(*ptr, *allocated_size, device_ids);
     vm_free(handle); // release the handle ASAP
 }
 

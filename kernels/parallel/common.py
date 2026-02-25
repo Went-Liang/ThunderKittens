@@ -105,7 +105,7 @@ def benchmark_l2_clear(
         func()
     torch.cuda.synchronize()
 
-    l2_cache = torch.empty(1024 * 1024 * 128 // 2, dtype=torch.bfloat16, device=f"cuda:{_env['local_rank']}" if not single else "cuda")
+    l2_cache = torch.empty(1024 * 1024 * 128 // 2, dtype=torch.bfloat16, device="cuda")
 
     if use_events:
         start_events = [torch.cuda.Event(enable_timing=True) for _ in range(num_iters)]

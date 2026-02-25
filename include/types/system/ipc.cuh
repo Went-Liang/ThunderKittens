@@ -50,12 +50,15 @@ struct handle<flavor::VMM> {
     int handle_;
 };
 
-__host__ inline static void check_support(const int device_id) {
+__host__ inline static void check_support() {
+    int current_device;
+    CUDACHECK(cudaGetDevice(&current_device));
+    
     CUdevice device;
-    CUCHECK(cuDeviceGet(&device, device_id));
+    CUCHECK(cuDeviceGet(&device, current_device));
 
     int ipc_supported = 0;
-    CUDACHECK(cudaDeviceGetAttribute(&ipc_supported, cudaDevAttrIpcEventSupport, device_id));
+    CUDACHECK(cudaDeviceGetAttribute(&ipc_supported, cudaDevAttrIpcEventSupport, current_device));
     int ipc_handle_supported = 0;
     CUCHECK(cuDeviceGetAttribute(&ipc_handle_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED, device));
 
@@ -98,7 +101,7 @@ __host__ inline static void import_handle (
     void **ptr,
     IPC_HANDLE &ipc_handle,
     const size_t size,
-    int local_world_size
+    const std::vector<int> &device_ids
 ) {
     if constexpr (IPC_HANDLE::flavor_ == flavor::LEGACY) {
         CUDACHECK(cudaIpcOpenMemHandle(ptr, ipc_handle.handle_, cudaIpcMemLazyEnablePeerAccess)); // this is the only flag supported
@@ -106,7 +109,10 @@ __host__ inline static void import_handle (
         CUmemGenericAllocationHandle memory_handle;
         CUCHECK(cuMemImportFromShareableHandle(&memory_handle, reinterpret_cast<void *>(static_cast<uintptr_t>(ipc_handle.handle_)), detail::vmm::HANDLE_TYPE));
         detail::vmm::vm_map(ptr, memory_handle, size);
-        detail::vmm::vm_set_access(*ptr, size, local_world_size);
+        // Enable P2P access between all devices in the group
+        detail::vmm::enable_p2p_access(device_ids);
+        // Set access only for devices in this group
+        detail::vmm::vm_set_access_devices(*ptr, size, device_ids);
         detail::vmm::vm_free(memory_handle);
         close(ipc_handle.handle_); // close fd immediately
         ipc_handle.handle_ = -1;
