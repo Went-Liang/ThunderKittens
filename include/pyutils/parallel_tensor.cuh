@@ -330,7 +330,6 @@ struct TKParallelTensor {
         for (int i = 0; i < local_world_size_; i++) {
             device_ids[i] = group_id_ * local_world_size_ + i;
         }
-        detail::vmm::enable_p2p_access(device_ids);
         detail::vmm::vm_set_access_devices(multicast_ptr_, multicast_allocated_size_, device_ids);
 
         // Free the handles immediately

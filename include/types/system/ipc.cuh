@@ -109,8 +109,6 @@ __host__ inline static void import_handle (
         CUmemGenericAllocationHandle memory_handle;
         CUCHECK(cuMemImportFromShareableHandle(&memory_handle, reinterpret_cast<void *>(static_cast<uintptr_t>(ipc_handle.handle_)), detail::vmm::HANDLE_TYPE));
         detail::vmm::vm_map(ptr, memory_handle, size);
-        // Enable P2P access between all devices in the group
-        detail::vmm::enable_p2p_access(device_ids);
         // Set access only for devices in this group
         detail::vmm::vm_set_access_devices(*ptr, size, device_ids);
         detail::vmm::vm_free(memory_handle);
