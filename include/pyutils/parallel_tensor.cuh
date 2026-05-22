@@ -22,8 +22,8 @@ namespace py {
  *        Meant to be used as a single object per thread/process.
  */
 struct TKParallelTensor {
-    // Key: {local_rank, local_world_size, group_id}
-    inline static std::map<std::tuple<int, int, int>, KittensBroker> brokers_; // lazily initialized
+    // Key: {local_rank, local_world_size, group_id, broker_id}
+    inline static std::map<std::tuple<int, int, int, int>, KittensBroker> brokers_; // lazily initialized
 
     at::Tensor data_; // for direct access from PyTorch
     std::vector<int64_t> shape_;
@@ -34,7 +34,8 @@ struct TKParallelTensor {
 
     int local_rank_; // identical to device index
     int local_world_size_;
-    int group_id_;   // distributed group ID for multi-group IPC isolation
+    int group_id_;   // device group ID; used for contiguous device-id mapping
+    int broker_id_;  // IPC namespace ID; used for shm/socket isolation
 
     bool multicast_;
     void *multicast_ptr_;
@@ -46,12 +47,28 @@ struct TKParallelTensor {
     std::string shm_key_;   // copied from broker for debugging
     std::string sock_key_;  // copied from broker for debugging
 
+    __host__ inline auto broker_key() const {
+        return std::make_tuple(local_rank_, local_world_size_, group_id_, broker_id_);
+    }
+
+    __host__ inline static bool has_conflicting_broker_namespace(
+        int broker_id,
+        const std::tuple<int, int, int, int> &current_key
+    ) {
+        for (const auto &entry : brokers_) {
+            if (std::get<3>(entry.first) == broker_id && entry.first != current_key)
+                return true;
+        }
+        return false;
+    }
+
     __host__ inline TKParallelTensor(
         const at::Tensor &tensor,
         int local_rank,
         int local_world_size,
         bool multicast,
-        int group_id = 0
+        int group_id = 0,
+        int broker_id = -1
     ) : data_(tensor),
         shape_(tensor.sizes().vec()),
         dtype_(tensor.scalar_type()),
@@ -60,6 +77,7 @@ struct TKParallelTensor {
         local_rank_(local_rank),
         local_world_size_(local_world_size),
         group_id_(group_id),
+        broker_id_(broker_id < 0 ? group_id : broker_id),
         multicast_(multicast),
         multicast_ptr_(nullptr),
         multicast_allocated_size_(0),
@@ -74,17 +92,18 @@ struct TKParallelTensor {
         TORCH_CHECK(local_rank_ >= 0, "local_rank must be non-negative");
         TORCH_CHECK(local_rank_ < local_world_size_, "local_rank must be less than local_world_size");
         TORCH_CHECK(group_id_ >= 0, "group_id must be non-negative");
+        TORCH_CHECK(broker_id_ >= 0, "broker_id must be non-negative");
         TORCH_CHECK(!multicast, "Multicast is not supported for pre-allocated tensors");
 
-        auto broker_key = std::make_tuple(local_rank_, local_world_size_, group_id_);
-        brokers_.try_emplace(broker_key, local_rank_, local_world_size_, group_id_);
+        auto key = broker_key();
+        brokers_.try_emplace(key, local_rank_, local_world_size_, group_id_, broker_id_);
         
         // Copy broker keys for debugging
-        shm_key_ = brokers_.at(broker_key).get_shm_key();
-        sock_key_ = brokers_.at(broker_key).get_sock_key();
+        shm_key_ = brokers_.at(key).get_shm_key();
+        sock_key_ = brokers_.at(key).get_sock_key();
 
-        if (brokers_.size() > 1)
-            std::cerr << "WARNING: Multiple KittensBroker instances created in the same process. This is not safe." << std::endl;
+        if (has_conflicting_broker_namespace(broker_id_, key))
+            std::cerr << "WARNING: Multiple KittensBroker instances share the same broker_id in the same process. This is not safe." << std::endl;
 
         // Use the actual GPU device where the tensor is located
         int global_device_idx = tensor.device().index();
@@ -98,7 +117,8 @@ struct TKParallelTensor {
         int local_rank,
         int local_world_size,
         bool multicast,
-        int group_id = 0
+        int group_id = 0,
+        int broker_id = -1
     ) : shape_(shape),
         dtype_(dtype),
         raw_ptrs_(local_world_size, nullptr),
@@ -106,6 +126,7 @@ struct TKParallelTensor {
         local_rank_(local_rank),
         local_world_size_(local_world_size),
         group_id_(group_id),
+        broker_id_(broker_id < 0 ? group_id : broker_id),
         multicast_(multicast),
         multicast_ptr_(nullptr),
         multicast_allocated_size_(0),
@@ -116,16 +137,17 @@ struct TKParallelTensor {
         TORCH_CHECK(local_rank_ >= 0, "local_rank must be non-negative");
         TORCH_CHECK(local_rank_ < local_world_size_, "local_rank must be less than local_world_size");
         TORCH_CHECK(group_id_ >= 0, "group_id must be non-negative");
+        TORCH_CHECK(broker_id_ >= 0, "broker_id must be non-negative");
 
-        auto broker_key = std::make_tuple(local_rank_, local_world_size_, group_id_);
-        brokers_.try_emplace(broker_key, local_rank_, local_world_size_, group_id_);
+        auto key = broker_key();
+        brokers_.try_emplace(key, local_rank_, local_world_size_, group_id_, broker_id_);
         
         // Copy broker keys for debugging
-        shm_key_ = brokers_.at(broker_key).get_shm_key();
-        sock_key_ = brokers_.at(broker_key).get_sock_key();
+        shm_key_ = brokers_.at(key).get_shm_key();
+        sock_key_ = brokers_.at(key).get_sock_key();
 
-        if (brokers_.size() > 1)
-            std::cerr << "WARNING: Multiple KittensBroker instances created in the same process. This is not safe." << std::endl;
+        if (has_conflicting_broker_namespace(broker_id_, key))
+            std::cerr << "WARNING: Multiple KittensBroker instances share the same broker_id in the same process. This is not safe." << std::endl;
 
         // Get the actual GPU device (set by torch.cuda.set_device)
         int global_device_idx;
@@ -152,6 +174,7 @@ struct TKParallelTensor {
         local_rank_(other.local_rank_),
         local_world_size_(other.local_world_size_),
         group_id_(other.group_id_),
+        broker_id_(other.broker_id_),
         multicast_(other.multicast_),
         multicast_ptr_(other.multicast_ptr_),
         multicast_allocated_size_(other.multicast_allocated_size_),
@@ -166,6 +189,7 @@ struct TKParallelTensor {
         other.local_rank_ = -1;
         other.local_world_size_ = -1;
         other.group_id_ = -1;
+        other.broker_id_ = -1;
         other.multicast_ = false;
         other.multicast_ptr_ = nullptr;
         other.multicast_allocated_size_ = 0;
@@ -240,15 +264,15 @@ struct TKParallelTensor {
 
         // Exchange IPC handles
         std::vector<handle_t> all_ipc_handles(local_world_size_);
-        auto broker_key = std::make_tuple(local_rank_, local_world_size_, group_id_);
+        auto key = broker_key();
         if constexpr (IPC_FLAVOR == detail::ipc::flavor::LEGACY) {
-            brokers_.at(broker_key).exchange_data(
+            brokers_.at(key).exchange_data(
                 reinterpret_cast<void *>(all_ipc_handles.data()),
                 reinterpret_cast<void *>(&ipc_handle),
                 sizeof(handle_t)
             );
         } else if constexpr (IPC_FLAVOR == detail::ipc::flavor::VMM) {
-            brokers_.at(broker_key).exchange_fds(
+            brokers_.at(key).exchange_fds(
                 reinterpret_cast<int *>(all_ipc_handles.data()),
                 ipc_handle.handle_
             );
@@ -301,27 +325,27 @@ struct TKParallelTensor {
             detail::ipc::export_handle(&ipc_handle, multicast_handle);
 
             // Broadcast the IPC multicast handle
-            auto broker_key = std::make_tuple(local_rank_, local_world_size_, group_id_);
-            brokers_.at(broker_key).broadcast_fd(nullptr, ipc_handle.handle_, 0);
+            auto key = broker_key();
+            brokers_.at(key).broadcast_fd(nullptr, ipc_handle.handle_, 0);
         } else {
             // Receive the IPC multicast handle from rank 0
-            auto broker_key = std::make_tuple(local_rank_, local_world_size_, group_id_);
+            auto key = broker_key();
             handle_t ipc_handle;
-            brokers_.at(broker_key).broadcast_fd(&ipc_handle.handle_, -1, 0);
+            brokers_.at(key).broadcast_fd(&ipc_handle.handle_, -1, 0);
             multicast_allocated_size_ = allocated_size_;
             detail::ipc::import_handle(&multicast_handle, ipc_handle, multicast_allocated_size_, local_world_size_);
         }
 
         // Add all devices to the MC handle. Must sync
-        auto broker_key = std::make_tuple(local_rank_, local_world_size_, group_id_);
+        auto key = broker_key();
         detail::vmm::multicast_bind_device(multicast_handle, global_device_idx);
-        brokers_.at(broker_key).sync(); // must ensure all devices are added
+        brokers_.at(key).sync(); // must ensure all devices are added
 
         // Bind all memory to the MC handle and map to a virtual address; must be done after adding all devices
         detail::vmm::handle memory_handle;
         detail::vmm::vm_retrieve_handle(&memory_handle, raw_ptrs_[local_rank_]);
         detail::vmm::multicast_bind_memory(multicast_handle, memory_handle, allocated_size_);
-        brokers_.at(broker_key).sync();
+        brokers_.at(key).sync();
 
 // Map virtual address to multicast handle and set access; must be done after adding all devices
         detail::vmm::vm_map(&multicast_ptr_, multicast_handle, multicast_allocated_size_);
@@ -346,15 +370,15 @@ struct TKParallelTensor {
                 global_device_idx = data_.device().index();
             }
             
-            auto broker_key = std::make_tuple(local_rank_, local_world_size_, group_id_);
-            brokers_.at(broker_key).sync();
+            auto key = broker_key();
+            brokers_.at(key).sync();
             detail::vmm::handle multicast_handle;
             detail::vmm::vm_retrieve_handle(&multicast_handle, multicast_ptr_);
             detail::vmm::vm_unmap(multicast_ptr_, multicast_allocated_size_);
             if (global_device_idx >= 0) {
                 detail::vmm::multicast_unbind_device(multicast_handle, multicast_allocated_size_, global_device_idx);
             }
-            brokers_.at(broker_key).sync();
+            brokers_.at(key).sync();
             detail::vmm::vm_free(multicast_handle);
         }
 
@@ -370,8 +394,8 @@ struct TKParallelTensor {
                 }
             }
         }
-        auto broker_key = std::make_tuple(local_rank_, local_world_size_, group_id_);
-        brokers_.at(broker_key).sync(); // must sync before destroying the tensor
+        auto key = broker_key();
+        brokers_.at(key).sync(); // must sync before destroying the tensor
 
         // 3. Tensor cleanup
         if (data_.defined())
@@ -385,6 +409,7 @@ struct TKParallelTensor {
         local_rank_ = -1;
         local_world_size_ = -1;
         group_id_ = -1;
+        broker_id_ = -1;
         multicast_ = false;
         multicast_ptr_ = nullptr;
         multicast_allocated_size_ = 0;
@@ -400,6 +425,7 @@ struct TKParallelTensor {
                " local_rank=" + std::to_string(local_rank_) +
                " local_world_size=" + std::to_string(local_world_size_) +
                " group_id=" + std::to_string(group_id_) +
+               " broker_id=" + std::to_string(broker_id_) +
                " multicast=" + std::to_string(multicast_) +
                " shm_key=" + shm_key_ +
                " sock_key=" + sock_key_;
@@ -411,24 +437,27 @@ struct TKParallelTensor {
 
 #define BIND_TK_PARALLEL_TENSOR(m) \
     pybind11::class_<kittens::py::TKParallelTensor>(m, "TKParallelTensor") \
-        .def(pybind11::init<const at::Tensor&, int, int, bool, int>(), \
+        .def(pybind11::init<const at::Tensor&, int, int, bool, int, int>(), \
              pybind11::arg("tensor"), \
              pybind11::arg("local_rank"), \
              pybind11::arg("local_world_size"), \
              pybind11::arg("multicast") = false, \
-             pybind11::arg("group_id") = 0) \
-        .def(pybind11::init<const std::vector<int64_t>&, const at::ScalarType&, int, int, bool, int>(), \
+             pybind11::arg("group_id") = 0, \
+             pybind11::arg("broker_id") = -1) \
+        .def(pybind11::init<const std::vector<int64_t>&, const at::ScalarType&, int, int, bool, int, int>(), \
              pybind11::arg("shape"), \
              pybind11::arg("dtype"), \
              pybind11::arg("local_rank"), \
              pybind11::arg("local_world_size"), \
              pybind11::arg("multicast") = false, \
-             pybind11::arg("group_id") = 0) \
+             pybind11::arg("group_id") = 0, \
+             pybind11::arg("broker_id") = -1) \
         .def("data", &kittens::py::TKParallelTensor::data) \
         .def("get_info_string", &kittens::py::TKParallelTensor::get_info_string) \
         .def_readonly("data_", &kittens::py::TKParallelTensor::data_) \
         .def_readonly("local_rank_", &kittens::py::TKParallelTensor::local_rank_) \
         .def_readonly("local_world_size_", &kittens::py::TKParallelTensor::local_world_size_) \
         .def_readonly("group_id_", &kittens::py::TKParallelTensor::group_id_) \
+        .def_readonly("broker_id_", &kittens::py::TKParallelTensor::broker_id_) \
         .def_readonly("shm_key_", &kittens::py::TKParallelTensor::shm_key_) \
         .def_readonly("sock_key_", &kittens::py::TKParallelTensor::sock_key_)

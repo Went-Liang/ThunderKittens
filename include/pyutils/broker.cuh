@@ -345,7 +345,8 @@ struct KittensBroker {
 
     int local_rank_;
     int local_world_size_;
-    int group_id_;  // Distributed group ID for isolation
+    int group_id_;  // Distributed group ID for debugging/backward compatibility
+    int broker_id_; // IPC namespace ID used for shm/socket isolation
 
     std::string shm_key_;   // Group-specific shared memory key
     std::string sock_key_;  // Group-specific socket key
@@ -354,21 +355,22 @@ struct KittensBroker {
     volatile detail::broker::KittensVault *shm_;
     int sock_;
 
-    // Helper function to generate keys based on group_id
-    __host__ inline static std::string make_shm_key(int group_id) {
-        return std::string(SHM_KEY_PREFIX) + std::to_string(group_id) + "_shm";
+    // Helper function to generate keys based on broker_id
+    __host__ inline static std::string make_shm_key(int broker_id) {
+        return std::string(SHM_KEY_PREFIX) + std::to_string(broker_id) + "_shm";
     }
 
-    __host__ inline static std::string make_sock_key(int group_id) {
-        return std::string(SOCK_KEY_PREFIX) + std::to_string(group_id) + ".sock";
+    __host__ inline static std::string make_sock_key(int broker_id) {
+        return std::string(SOCK_KEY_PREFIX) + std::to_string(broker_id) + ".sock";
     }
 
-    __host__ inline KittensBroker(int local_rank, int local_world_size, int group_id = 0)
+    __host__ inline KittensBroker(int local_rank, int local_world_size, int group_id = 0, int broker_id = -1)
         : local_rank_(local_rank), 
           local_world_size_(local_world_size),
           group_id_(group_id),
-          shm_key_(make_shm_key(group_id)),
-          sock_key_(make_sock_key(group_id)),
+          broker_id_(broker_id < 0 ? group_id : broker_id),
+          shm_key_(make_shm_key(broker_id_)),
+          sock_key_(make_sock_key(broker_id_)),
           shm_raw_(nullptr),
           shm_(nullptr),
           sock_(-1) {
@@ -380,6 +382,8 @@ struct KittensBroker {
             throw std::runtime_error("KittensBroker: Local world size is greater than MAX_LOCAL_WORLD_SIZE");
         if (group_id_ < 0)
             throw std::runtime_error("KittensBroker: Group ID must be non-negative");
+        if (broker_id_ < 0)
+            throw std::runtime_error("KittensBroker: Broker ID must be non-negative");
 
         if (local_rank_ == 0) {
             shm_raw_ = detail::broker::create_shm(shm_key_.c_str(), sizeof(detail::broker::KittensVault));
@@ -402,6 +406,7 @@ struct KittensBroker {
 
     // Getters for debugging
     __host__ inline int get_group_id() const { return group_id_; }
+    __host__ inline int get_broker_id() const { return broker_id_; }
     __host__ inline const std::string& get_shm_key() const { return shm_key_; }
     __host__ inline const std::string& get_sock_key() const { return sock_key_; }
 
@@ -412,6 +417,7 @@ struct KittensBroker {
         : local_rank_(other.local_rank_),
           local_world_size_(other.local_world_size_),
           group_id_(other.group_id_),
+          broker_id_(other.broker_id_),
           shm_key_(std::move(other.shm_key_)),
           sock_key_(std::move(other.sock_key_)),
           shm_raw_(other.shm_raw_),
@@ -420,6 +426,7 @@ struct KittensBroker {
         other.local_rank_ = -1;
         other.local_world_size_ = -1;
         other.group_id_ = -1;
+        other.broker_id_ = -1;
         other.shm_raw_ = nullptr;
         other.shm_ = nullptr;
         other.sock_ = -1;
@@ -439,6 +446,7 @@ struct KittensBroker {
         local_rank_ = -1;
         local_world_size_ = -1;
         group_id_ = -1;
+        broker_id_ = -1;
     }
 
     __host__ inline KittensBroker& operator=(KittensBroker&& other) noexcept {
@@ -447,6 +455,7 @@ struct KittensBroker {
             local_rank_ = other.local_rank_;
             local_world_size_ = other.local_world_size_;
             group_id_ = other.group_id_;
+            broker_id_ = other.broker_id_;
             shm_key_ = std::move(other.shm_key_);
             sock_key_ = std::move(other.sock_key_);
             shm_raw_ = other.shm_raw_;
@@ -455,6 +464,7 @@ struct KittensBroker {
             other.local_rank_ = -1;
             other.local_world_size_ = -1;
             other.group_id_ = -1;
+            other.broker_id_ = -1;
             other.shm_raw_ = nullptr;
             other.shm_ = nullptr;
             other.sock_ = -1;

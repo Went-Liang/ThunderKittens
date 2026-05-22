@@ -1,9 +1,9 @@
 import torch.distributed as dist
 import os
 import torch
-from mmq.distributed import process_groups
-from mmq_kernels.utils.enable_kernel_log import enable_kernel_log
+
 from _C import TKParallelTensor, tk_all_to_all as _tk_all_to_all_cpp
+
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from common import (
@@ -84,14 +84,13 @@ def make_tk_input(input_, scatter_idx, gather_idx, group):
         local_rank=ap_rank,
         local_world_size=ap_world_size,
         multicast=True,
-        group_id=group_id
+        group_id=group_id,
     )
     barrier_tk.data_.zero_()
     torch.distributed.barrier()
     return input_tk, output_tk, barrier_tk
 
 
-@enable_kernel_log
 def tk_all_to_all(
     input_: torch.Tensor,
     input_tk: TKParallelTensor,
@@ -218,10 +217,18 @@ if __name__ == "__main__":
         (8192*4, 24, 256),
         (8192*4, 8, 128),
         (8192*4, 96, 128),
+        (8192*4, 16, 72),
+        (16384, 16, 72),
     ]:
         if n_heads < ap_world_size:
             continue
         all2all_test(n_tokens, n_heads, n_dim, 1, 0)
+    for n_tokens, n_heads, n_dim in [
+        (65536, 4, 72),
+    ]:
+        if n_heads < ap_world_size:
+            continue
+        all2all_test(n_tokens, n_heads, n_dim, 0, 1)
     torch.distributed.destroy_process_group()
 
 # python -m torch.distributed.run --nproc_per_node=8 test.py
