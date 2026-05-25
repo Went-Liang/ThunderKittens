@@ -25,12 +25,14 @@ struct TKParallelTensor {
     // Key: {local_rank, local_world_size, group_id, broker_id}
     inline static std::map<std::tuple<int, int, int, int>, KittensBroker> brokers_; // lazily initialized
 
-    at::Tensor data_; // for direct access from PyTorch
+    at::Tensor data_;    // logical view for direct access from PyTorch
+    at::Tensor storage_; // owner of the full shareable allocation
     std::vector<int64_t> shape_;
     at::ScalarType dtype_;
 
     std::vector<void *> raw_ptrs_;
     size_t allocated_size_;
+    size_t storage_nbytes_;
 
     int local_rank_; // identical to device index
     int local_world_size_;
@@ -70,10 +72,12 @@ struct TKParallelTensor {
         int group_id = 0,
         int broker_id = -1
     ) : data_(tensor),
+        storage_(tensor),
         shape_(tensor.sizes().vec()),
         dtype_(tensor.scalar_type()),
         raw_ptrs_(local_world_size, nullptr),
         allocated_size_(tensor.nbytes()),
+        storage_nbytes_(tensor.nbytes()),
         local_rank_(local_rank),
         local_world_size_(local_world_size),
         group_id_(group_id),
@@ -123,6 +127,7 @@ struct TKParallelTensor {
         dtype_(dtype),
         raw_ptrs_(local_world_size, nullptr),
         allocated_size_(0),
+        storage_nbytes_(0),
         local_rank_(local_rank),
         local_world_size_(local_world_size),
         group_id_(group_id),
@@ -167,10 +172,12 @@ struct TKParallelTensor {
 
     __host__ inline TKParallelTensor(TKParallelTensor&& other) :
         data_(std::move(other.data_)),
+        storage_(std::move(other.storage_)),
         shape_(std::move(other.shape_)),
         dtype_(std::move(other.dtype_)),
         raw_ptrs_(std::move(other.raw_ptrs_)),
         allocated_size_(other.allocated_size_),
+        storage_nbytes_(other.storage_nbytes_),
         local_rank_(other.local_rank_),
         local_world_size_(other.local_world_size_),
         group_id_(other.group_id_),
@@ -182,10 +189,12 @@ struct TKParallelTensor {
         shm_key_(std::move(other.shm_key_)),
         sock_key_(std::move(other.sock_key_)) {
         other.data_ = at::Tensor();
+        other.storage_ = at::Tensor();
         other.shape_.clear();
         other.dtype_ = at::ScalarType::Undefined;
         other.raw_ptrs_.clear();
         other.allocated_size_ = 0;
+        other.storage_nbytes_ = 0;
         other.local_rank_ = -1;
         other.local_world_size_ = -1;
         other.group_id_ = -1;
@@ -203,6 +212,35 @@ struct TKParallelTensor {
         return data_;
     }
 
+    __host__ inline size_t nbytes_for_shape(const std::vector<int64_t> &shape) const {
+        TORCH_CHECK(!shape.empty(), "Shape must be non-empty");
+        TORCH_CHECK(shape.size() <= 4, "Shape must have at most 4 dimensions for TKParallelTensor");
+
+        size_t size = c10::elementSize(dtype_);
+        for (auto dim : shape) {
+            TORCH_CHECK(dim > 0, "Size dimensions must be positive");
+            size *= static_cast<size_t>(dim);
+        }
+        return size;
+    }
+
+    __host__ inline static std::vector<int64_t> contiguous_strides(const std::vector<int64_t> &shape) {
+        std::vector<int64_t> strides(shape.size(), 1);
+        for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i)
+            strides[i] = strides[i + 1] * shape[i + 1];
+        return strides;
+    }
+
+    __host__ inline void set_logical_shape(const std::vector<int64_t> &logical_shape) {
+        TORCH_CHECK(storage_.defined(), "Cannot set logical shape on an undefined TKParallelTensor storage");
+        TORCH_CHECK(nbytes_for_shape(logical_shape) <= storage_nbytes_,
+                    "Logical shape exceeds TKParallelTensor storage capacity");
+
+        data_ = storage_.as_strided(logical_shape, contiguous_strides(logical_shape));
+        shape_ = logical_shape;
+        raw_ptrs_[local_rank_] = reinterpret_cast<void *>(data_.data_ptr());
+    }
+
     __host__ inline void create_shareable_cuda_tensor() {
         // Get the actual GPU device (set by torch.cuda.set_device)
         // local_rank_ is the relative rank within AP group, but we need the actual GPU device index
@@ -210,13 +248,7 @@ struct TKParallelTensor {
         CUDACHECK(cudaGetDevice(&global_device_idx));
         c10::cuda::CUDAGuard device_guard(global_device_idx);
 
-        TORCH_CHECK(!shape_.empty(), "Shape must be non-empty");
-        TORCH_CHECK(shape_.size() <= 4, "Shape must have at most 4 dimensions for TKParallelTensor");
-        size_t size = c10::elementSize(dtype_);
-        for (auto dim : shape_) {
-            TORCH_CHECK(dim > 0, "Size dimensions must be positive");
-            size *= static_cast<size_t>(dim);
-        }
+        size_t size = nbytes_for_shape(shape_);
 
 // First, we need to exchange device IDs within the group
         // For now, we assume devices are consecutive from (group_id * local_world_size) to ((group_id + 1) * local_world_size - 1)
@@ -246,7 +278,9 @@ struct TKParallelTensor {
             .dtype(dtype_)
             .device(at::kCUDA, global_device_idx);
 
-        data_ = at::from_blob(raw_ptr, shape_, std::move(deleter), options);
+        storage_nbytes_ = size;
+        storage_ = at::from_blob(raw_ptr, shape_, std::move(deleter), options);
+        data_ = storage_;
     }
 
     template <detail::ipc::flavor IPC_FLAVOR>
@@ -400,12 +434,15 @@ struct TKParallelTensor {
         // 3. Tensor cleanup
         if (data_.defined())
             data_.reset(); // properly decreases the ref count
+        if (storage_.defined())
+            storage_.reset();
 
         // 4. Member variables cleanup
         shape_.clear();
         dtype_ = at::ScalarType::Undefined;
         raw_ptrs_.clear();
         allocated_size_ = 0;
+        storage_nbytes_ = 0;
         local_rank_ = -1;
         local_world_size_ = -1;
         group_id_ = -1;
@@ -453,6 +490,7 @@ struct TKParallelTensor {
              pybind11::arg("group_id") = 0, \
              pybind11::arg("broker_id") = -1) \
         .def("data", &kittens::py::TKParallelTensor::data) \
+        .def("set_logical_shape", &kittens::py::TKParallelTensor::set_logical_shape) \
         .def("get_info_string", &kittens::py::TKParallelTensor::get_info_string) \
         .def_readonly("data_", &kittens::py::TKParallelTensor::data_) \
         .def_readonly("local_rank_", &kittens::py::TKParallelTensor::local_rank_) \
